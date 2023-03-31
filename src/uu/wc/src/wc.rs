@@ -16,7 +16,7 @@ use countable::WordCountable;
 use unicode_width::UnicodeWidthChar;
 use utf8::{BufReadDecoder, BufReadDecoderError};
 use uucore::{format_usage, help_about, help_usage, show};
-use word_count::{TitledWordCount, WordCount};
+use word_count::WordCount;
 
 use clap::{crate_version, Arg, ArgAction, ArgMatches, Command};
 
@@ -594,22 +594,19 @@ fn wc(inputs: &[Input], settings: &Settings) -> UResult<()> {
             }
         };
         total_word_count += word_count;
-        let result = word_count.with_title(input.to_title(&settings.title_quoting_style));
-        if let Err(err) = print_stats(settings, &result, number_width) {
+        let maybe_title = input.to_title(&settings.title_quoting_style);
+        let maybe_title_str = maybe_title.as_deref();
+        if let Err(err) = print_stats(settings, &word_count, maybe_title_str, number_width) {
+            let title = maybe_title_str.unwrap_or("<stdin>");
             show!(USimpleError::new(
                 1,
-                format!(
-                    "failed to print result for {}: {}",
-                    &result.title.unwrap_or_else(|| String::from("<stdin>")),
-                    err,
-                ),
+                format!("failed to print result for {}: {}", title, err),
             ));
         }
     }
 
     if num_inputs > 1 {
-        let total_result = total_word_count.with_title(Some(String::from("total")));
-        if let Err(err) = print_stats(settings, &total_result, number_width) {
+        if let Err(err) = print_stats(settings, &total_word_count, Some("total"), number_width) {
             show!(USimpleError::new(
                 1,
                 format!("failed to print total: {err}")
@@ -624,29 +621,35 @@ fn wc(inputs: &[Input], settings: &Settings) -> UResult<()> {
 
 fn print_stats(
     settings: &Settings,
-    result: &TitledWordCount,
+    result: &WordCount,
+    title: Option<&str>,
     number_width: usize,
 ) -> io::Result<()> {
-    let mut columns = Vec::new();
+    let mut stdout = io::stdout().lock();
 
-    if settings.show_lines {
-        columns.push(format!("{:1$}", result.count.lines, number_width));
-    }
-    if settings.show_words {
-        columns.push(format!("{:1$}", result.count.words, number_width));
-    }
-    if settings.show_chars {
-        columns.push(format!("{:1$}", result.count.chars, number_width));
-    }
-    if settings.show_bytes {
-        columns.push(format!("{:1$}", result.count.bytes, number_width));
-    }
-    if settings.show_max_line_length {
-        columns.push(format!("{:1$}", result.count.max_line_length, number_width));
-    }
-    if let Some(title) = &result.title {
-        columns.push(title.clone());
+    let mut space = "";
+
+    macro_rules! print_column {
+        ($s:ident, $c:ident) => {
+            if settings.$s {
+                write!(stdout, "{space}{:width$}", result.$c, width = number_width)?;
+                #[allow(unused_assignments)]
+                {
+                    space = " ";
+                }
+            }
+        };
     }
 
-    writeln!(io::stdout().lock(), "{}", columns.join(" "))
+    print_column!(show_lines, lines);
+    print_column!(show_words, words);
+    print_column!(show_chars, chars);
+    print_column!(show_bytes, bytes);
+    print_column!(show_max_line_length, max_line_length);
+
+    if let Some(title) = title {
+        writeln!(stdout, "{space}{title}")
+    } else {
+        writeln!(stdout)
+    }
 }
