@@ -10,27 +10,35 @@
 mod count_fast;
 mod countable;
 mod word_count;
-use clap::builder::ValueParser;
-use count_fast::{count_bytes_chars_and_lines_fast, count_bytes_fast};
-use countable::WordCountable;
+
+use std::{
+    borrow::Cow,
+    cmp::max,
+    ffi::{OsStr, OsString},
+    fmt::Display,
+    fs::{self, File},
+    io::{self, Write},
+    iter,
+    path::{Path, PathBuf},
+};
+
+use clap::{builder::ValueParser, crate_version, Arg, ArgAction, ArgMatches, Command};
+use thiserror::Error;
 use unicode_width::UnicodeWidthChar;
 use utf8::{BufReadDecoder, BufReadDecoderError};
-use uucore::{format_usage, help_about, help_usage, show};
-use word_count::WordCount;
 
-use clap::{crate_version, Arg, ArgAction, ArgMatches, Command};
+use uucore::{
+    error::{FromIo, UError, UIoError, UResult, USimpleError},
+    format_usage, help_about, help_usage,
+    quoting_style::{escape_name, QuotingStyle},
+    show,
+};
 
-use std::borrow::Cow;
-use std::cmp::max;
-use std::error::Error;
-use std::ffi::{OsStr, OsString};
-use std::fmt::Display;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::path::PathBuf;
-
-use uucore::error::{UError, UResult, USimpleError};
-use uucore::quoting_style::{escape_name, QuotingStyle};
+use crate::{
+    count_fast::{count_bytes_chars_and_lines_fast, count_bytes_fast},
+    countable::WordCountable,
+    word_count::WordCount,
+};
 
 /// The minimum character width for formatting counts when reading from stdin.
 const MINIMUM_WIDTH: usize = 7;
@@ -41,7 +49,6 @@ struct Settings {
     show_lines: bool,
     show_words: bool,
     show_max_line_length: bool,
-    files0_from_stdin_mode: bool,
 }
 
 impl Default for Settings {
@@ -53,34 +60,24 @@ impl Default for Settings {
             show_lines: true,
             show_words: true,
             show_max_line_length: false,
-            files0_from_stdin_mode: false,
         }
     }
 }
 
 impl Settings {
     fn new(matches: &ArgMatches) -> Self {
-        let files0_from_stdin_mode = match matches.get_one::<String>(options::FILES0_FROM) {
-            Some(files_0_from) => files_0_from == STDIN_REPR,
-            None => false,
-        };
-
         let settings = Self {
             show_bytes: matches.get_flag(options::BYTES),
             show_chars: matches.get_flag(options::CHAR),
             show_lines: matches.get_flag(options::LINES),
             show_words: matches.get_flag(options::WORDS),
             show_max_line_length: matches.get_flag(options::MAX_LINE_LENGTH),
-            files0_from_stdin_mode,
         };
 
         if settings.number_enabled() > 0 {
             settings
         } else {
-            Self {
-                files0_from_stdin_mode,
-                ..Default::default()
-            }
+            Default::default()
         }
     }
 
@@ -109,7 +106,6 @@ mod options {
     pub static MAX_LINE_LENGTH: &str = "max-line-length";
     pub static WORDS: &str = "words";
 }
-
 static ARG_FILES: &str = "files";
 static STDIN_REPR: &str = "-";
 
@@ -118,35 +114,50 @@ static QS_ESCAPE: &QuotingStyle = &QuotingStyle::Shell {
     always_quote: false,
     show_control: false,
 };
-
-enum StdinKind {
-    /// Stdin specified on command-line with "-".
-    Explicit,
-
-    /// Stdin implicitly specified on command-line by not passing any positional argument.
-    Implicit,
-}
+static QS_QUOTE_ESCAPE: &QuotingStyle = &QuotingStyle::Shell {
+    escape: true,
+    always_quote: true,
+    show_control: false,
+};
 
 /// Supported inputs.
-enum Input {
-    /// A regular file.
-    Path(PathBuf),
-
-    /// Standard input.
-    Stdin(StdinKind),
+enum Inputs {
+    /// Default Standard input, i.e. no arguments.
+    Stdin,
+    /// Files; "-" means stdin, possibly multiple times!
+    Paths(Vec<OsString>),
+    /// --files0-from; "-" means stdin.
+    Files0From(OsString),
 }
 
-impl From<&OsStr> for Input {
-    fn from(input: &OsStr) -> Self {
-        if input == STDIN_REPR {
-            Self::Stdin(StdinKind::Explicit)
-        } else {
-            Self::Path(input.into())
+impl Inputs {
+    fn new(matches: &ArgMatches) -> UResult<Self> {
+        let arg_files = matches.get_many::<OsString>(ARG_FILES);
+        let files0_from = matches.get_one::<OsString>(options::FILES0_FROM);
+
+        match (arg_files, files0_from) {
+            (None, None) => Ok(Self::Stdin),
+            (Some(files), None) => Ok(Self::Paths(files.cloned().collect())),
+            (None, Some(path)) => Ok(Self::Files0From(path.into())),
+            (Some(_), Some(_)) => Err(WcError::FilesDisabled.into()),
         }
     }
 }
 
-impl Input {
+enum StdinKind {
+    /// Specified on command-line with "-" (STDIN_REPR)
+    Explicit,
+    /// Implied by the lack of any arguments
+    Implicit,
+}
+
+/// Represents a single input.
+enum Input<'a> {
+    Path(Cow<'a, Path>),
+    Stdin(StdinKind),
+}
+
+impl Input<'_> {
     /// Converts input to title that appears in stats.
     fn to_title(&self) -> Option<Cow<str>> {
         match self {
@@ -162,38 +173,35 @@ impl Input {
     /// Converts input into the form that appears in errors.
     fn path_display(&self) -> Cow<'static, str> {
         match self {
-            Self::Path(path) => escape_name(OsStr::new(&path), QS_ESCAPE).into(),
+            Self::Path(path) => escape_name(OsStr::new(path.as_ref()), QS_ESCAPE).into(),
             Self::Stdin(_) => Cow::Borrowed("standard input"),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 enum WcError {
-    FilesDisabled(String),
-    StdinReprNotAllowed(String),
+    #[error("file operands cannot be combined with --files0-from")]
+    FilesDisabled,
+    #[error("when reading file names from stdin, no file name of '-' allowed")]
+    StdinReprNotAllowed,
+    #[error("invalid zero-length file name")]
+    ZeroLengthFileName,
+    #[error("{path}:{idx}: invalid zero-length file name")]
+    ZeroLengthFileNameCtx { path: String, idx: usize },
 }
 
 impl UError for WcError {
-    fn code(&self) -> i32 {
-        match self {
-            Self::FilesDisabled(_) | Self::StdinReprNotAllowed(_) => 1,
-        }
-    }
-
     fn usage(&self) -> bool {
-        matches!(self, Self::FilesDisabled(_))
+        matches!(self, Self::FilesDisabled)
     }
 }
 
-impl Error for WcError {}
-
-impl Display for WcError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::FilesDisabled(message) | Self::StdinReprNotAllowed(message) => {
-                write!(f, "{message}")
-            }
+impl WcError {
+    fn zero_len(ctx: Option<(String, usize)>) -> Self {
+        match ctx {
+            Some((path, idx)) => Self::ZeroLengthFileNameCtx { path, idx },
+            None => Self::ZeroLengthFileName,
         }
     }
 }
@@ -202,9 +210,8 @@ impl Display for WcError {
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let matches = uu_app().try_get_matches_from(args)?;
 
-    let inputs = inputs(&matches)?;
-
     let settings = Settings::new(&matches);
+    let inputs = Inputs::new(&matches)?;
 
     wc(&inputs, &settings)
 }
@@ -233,11 +240,12 @@ pub fn uu_app() -> Command {
             Arg::new(options::FILES0_FROM)
                 .long(options::FILES0_FROM)
                 .value_name("F")
-                .help(
-                    "read input from the files specified by
-    NUL-terminated names in file F;
-    If F is - then read names from standard input",
-                )
+                .help(concat!(
+                    "read input from the files specified by\n",
+                    "  NUL-terminated names in file F;\n",
+                    "  If F is - then read names from standard input"
+                ))
+                .value_parser(ValueParser::os_string())
                 .value_hint(clap::ValueHint::FilePath),
         )
         .arg(
@@ -267,47 +275,6 @@ pub fn uu_app() -> Command {
                 .value_parser(ValueParser::os_string())
                 .value_hint(clap::ValueHint::FilePath),
         )
-}
-
-fn inputs(matches: &ArgMatches) -> UResult<Vec<Input>> {
-    match matches.get_many::<OsString>(ARG_FILES) {
-        Some(os_values) => {
-            if matches.contains_id(options::FILES0_FROM) {
-                return Err(WcError::FilesDisabled(
-                    "file operands cannot be combined with --files0-from".into(),
-                )
-                .into());
-            }
-
-            Ok(os_values.map(|s| Input::from(s.as_os_str())).collect())
-        }
-        None => match matches.get_one::<String>(options::FILES0_FROM) {
-            Some(files_0_from) => create_paths_from_files0(files_0_from),
-            None => Ok(vec![Input::Stdin(StdinKind::Implicit)]),
-        },
-    }
-}
-
-fn create_paths_from_files0(files_0_from: &str) -> UResult<Vec<Input>> {
-    let mut paths = String::new();
-    let read_from_stdin = files_0_from == STDIN_REPR;
-
-    if read_from_stdin {
-        io::stdin().lock().read_to_string(&mut paths)?;
-    } else {
-        File::open(files_0_from)?.read_to_string(&mut paths)?;
-    }
-
-    let paths: Vec<&str> = paths.split_terminator('\0').collect();
-
-    if read_from_stdin && paths.contains(&STDIN_REPR) {
-        return Err(WcError::StdinReprNotAllowed(
-            "when reading file names from stdin, no file name of '-' allowed".into(),
-        )
-        .into());
-    }
-
-    Ok(paths.iter().map(OsStr::new).map(Input::from).collect())
 }
 
 fn word_count_from_reader<T: WordCountable>(
@@ -485,75 +452,64 @@ enum CountResult {
     /// Nothing went wrong.
     Success(WordCount),
     /// Managed to open but failed to read.
-    Interrupted(WordCount, io::Error),
+    Interrupted(WordCount, UIoError),
     /// Didn't even manage to open.
-    Failure(io::Error),
+    Failure(UIoError),
 }
 
-/// If we fail opening a file we only show the error. If we fail reading it
-/// we show a count for what we managed to read.
+/// If we fail opening a file, we only show the error. If we fail reading the
+/// file, we show a count for what we managed to read.
 ///
-/// Therefore the reading implementations always return a total and sometimes
+/// Therefore, the reading implementations always return a total and sometimes
 /// return an error: (WordCount, Option<io::Error>).
-fn word_count_from_input(input: &Input, settings: &Settings) -> CountResult {
-    match input {
-        Input::Stdin(_) => {
-            let stdin = io::stdin();
-            let stdin_lock = stdin.lock();
-            let count = word_count_from_reader(stdin_lock, settings);
-            match count {
-                (total, Some(error)) => CountResult::Interrupted(total, error),
-                (total, None) => CountResult::Success(total),
-            }
-        }
+fn word_count_from_input(input: &Input<'_>, settings: &Settings) -> CountResult {
+    let (total, maybe_err) = match input {
+        Input::Stdin(_) => word_count_from_reader(io::stdin().lock(), settings),
         Input::Path(path) => match File::open(path) {
-            Err(error) => CountResult::Failure(error),
-            Ok(file) => match word_count_from_reader(file, settings) {
-                (total, Some(error)) => CountResult::Interrupted(total, error),
-                (total, None) => CountResult::Success(total),
-            },
+            Ok(f) => word_count_from_reader(f, settings),
+            Err(err) => return CountResult::Failure(err.into()),
         },
+    };
+    match maybe_err {
+        None => CountResult::Success(total),
+        Some(err) => CountResult::Interrupted(total, err.into()),
     }
 }
 
 /// Compute the number of digits needed to represent all counts in all inputs.
 ///
-/// `inputs` may include zero or more [`Input::Stdin`] entries, each of
-/// which represents reading from `stdin`. The presence of any such
-/// entry causes this function to return a width that is at least
-/// [`MINIMUM_WIDTH`].
+/// For [`Inputs::Stdin`], [`MINIMUM_WIDTH`] is returned, unless there is only one counter number
+/// to be printed, in which case 1 is returned.
 ///
-/// If `input` is empty, or if only one number needs to be printed (for just
-/// one file) then this function is optimized to return 1 without making any
-/// calls to get file metadata.
+/// For [`Inputs::Files0From`], [`MINIMUM_WIDTH`] is returned.
 ///
-/// If file metadata could not be read from any of the [`Input::Path`] input,
-/// that input does not affect number width computation
+/// An [`Inputs::Paths`] may include zero or more "-" entries, each of which represents reading
+/// from `stdin`. The presence of any such entry causes this function to return a width that is at
+/// least [`MINIMUM_WIDTH`].
 ///
-/// Otherwise, the file sizes in the file metadata are summed and the number of
-/// digits in that total size is returned as the number width
+/// If an [`Inputs::Paths`] contains only one path and only one number needs to be printed then
+/// this function is optimized to return 1 without making any calls to get file metadata.
 ///
-/// To mirror GNU wc's behavior a special case is added. If --files0-from is
-/// used and input is read from stdin and there is only one calculation enabled
-/// columns will not be aligned. This is not exactly GNU wc's behavior, but it
-/// is close enough to pass the GNU test suite.
-fn compute_number_width(inputs: &[Input], settings: &Settings) -> usize {
-    if inputs.is_empty()
-        || (inputs.len() == 1 && settings.number_enabled() == 1)
-        || (settings.files0_from_stdin_mode && settings.number_enabled() == 1)
-    {
-        return 1;
-    }
-
-    let mut minimum_width = 1;
-    let mut total = 0;
-
-    for input in inputs {
-        match input {
-            Input::Stdin(_) => {
-                minimum_width = MINIMUM_WIDTH;
+/// If file metadata could not be read from any of the [`Input::Path`] input, that input does not
+/// affect number width computation.  Otherwise, the file sizes from the files' metadata are summed
+/// and the number of digits in that total size is returned.
+fn compute_number_width(inputs: &Inputs, settings: &Settings) -> usize {
+    match inputs {
+        Inputs::Stdin if settings.number_enabled() == 1 => 1,
+        Inputs::Stdin => MINIMUM_WIDTH,
+        Inputs::Files0From(_) => 1,
+        Inputs::Paths(paths) => {
+            if settings.number_enabled() == 1 && paths.len() == 1 {
+                return 1;
             }
-            Input::Path(path) => {
+
+            let mut minimum_width = 1;
+            let mut total: u64 = 0;
+            for path in paths.iter() {
+                if path == STDIN_REPR {
+                    minimum_width = MINIMUM_WIDTH;
+                    continue;
+                }
                 if let Ok(meta) = fs::metadata(path) {
                     if meta.is_file() {
                         total += meta.len();
@@ -562,34 +518,164 @@ fn compute_number_width(inputs: &[Input], settings: &Settings) -> usize {
                     }
                 }
             }
+
+            if total == 0 {
+                minimum_width
+            } else {
+                let total_width = (1 + total.ilog10())
+                    .try_into()
+                    .expect("ilog of one usize should fit into a usize");
+                max(total_width, minimum_width)
+            }
         }
     }
-
-    max(minimum_width, total.to_string().len())
 }
 
-fn wc(inputs: &[Input], settings: &Settings) -> UResult<()> {
+enum InputError {
+    Io(UIoError),
+    Wc(WcError),
+}
+
+impl From<WcError> for InputError {
+    fn from(e: WcError) -> Self {
+        Self::Wc(e)
+    }
+}
+
+impl From<io::Error> for InputError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e.into())
+    }
+}
+
+impl Display for InputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => e.fmt(f),
+            Self::Wc(e) => e.fmt(f),
+        }
+    }
+}
+
+type InputIterItem<'a> = Result<Input<'a>, InputError>;
+
+impl Inputs {
+    // Creates an iterator which yields values borrowed from the command line arguments.
+    // Returns an error if the file specified in --files0-from cannot be opened.
+    fn try_iter(&self) -> UResult<impl Iterator<Item = InputIterItem>> {
+        let base: Box<dyn Iterator<Item = _>> = match self {
+            Self::Stdin => Box::new(iter::once(Ok(Input::Stdin(StdinKind::Implicit)))),
+            Self::Paths(paths) => Box::new(paths.iter().map(|p| {
+                Ok(match p {
+                    p if p == STDIN_REPR => Input::Stdin(StdinKind::Explicit),
+                    p => Input::Path(Cow::Borrowed(p.as_ref())),
+                })
+            })),
+            Self::Files0From(path) if path == STDIN_REPR => Box::new(files0_iter_stdin()),
+            Self::Files0From(path) => Box::new(files0_iter_file(path)?),
+        };
+
+        // The index of each yielded item must be tracked for error reporting.
+        let mut with_idx = base.enumerate();
+        let path = match self {
+            Self::Files0From(path) => Some(path),
+            _ => None,
+        };
+
+        let iter = iter::from_fn(move || {
+            let (idx, next) = with_idx.next()?;
+            match next {
+                // filter zero length file names...
+                Ok(Input::Path(p)) if p.as_os_str().is_empty() => Some(Err(InputError::Wc(
+                    WcError::zero_len(path.map(|p| (escape_name(p, QS_ESCAPE), idx))),
+                ))),
+                _ => Some(next),
+            }
+        });
+        Ok(iter)
+    }
+}
+
+/// To be used with `--files0-from=-`, this applies a filter on the results of files0_iter to
+/// translate '-' into the appropriate error.
+fn files0_iter_stdin<'a>() -> impl Iterator<Item = InputIterItem<'a>> {
+    files0_iter(io::stdin().lock()).map(|i| match i {
+        Ok(Input::Stdin(_)) => Err(WcError::StdinReprNotAllowed.into()),
+        _ => i,
+    })
+}
+
+fn files0_iter_file<'a>(path: &OsStr) -> UResult<impl Iterator<Item = InputIterItem<'a>>> {
+    match File::open(path) {
+        Ok(f) => Ok(files0_iter(f)),
+        Err(e) => Err(e.map_err_context(|| {
+            format!(
+                "cannot open {} for reading",
+                escape_name(path, QS_QUOTE_ESCAPE)
+            )
+        })),
+    }
+}
+
+fn files0_iter<'a>(r: impl io::Read + 'static) -> impl Iterator<Item = InputIterItem<'a>> {
+    use std::io::BufRead;
+    io::BufReader::new(r).split(b'\0').map(|res| match res {
+        Ok(p) if p == STDIN_REPR.as_bytes() => Ok(Input::Stdin(StdinKind::Explicit)),
+        Ok(p) => {
+            // Unix systems have OsStrings which are simply strings of bytes, not necesarily UTF-8.
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                Ok(Input::Path(PathBuf::from(OsString::from_vec(p)).into()))
+            }
+
+            // ...Windows does not, we must go through Strings.
+            #[cfg(not(unix))]
+            {
+                let s =
+                    String::from_utf8(p).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                Ok(Input::Path(PathBuf::from(s).into()))
+            }
+        }
+        Err(e) => Err(e.into()),
+    })
+}
+
+/// shorthand for `show!(USimpleError::new(...))`, works just like `format!`.
+macro_rules! record_error {
+    ($fmt:literal $(, $arg:expr)*) => {
+        show!(USimpleError::new(
+            1,
+            format!($fmt $(, $arg)*)
+        ));
+    }
+}
+
+fn wc(inputs: &Inputs, settings: &Settings) -> UResult<()> {
     let number_width = compute_number_width(inputs, settings);
 
     let mut total_word_count = WordCount::default();
+    let mut num_inputs = 0u32;
 
-    let num_inputs = inputs.len();
+    for maybe_input in inputs.try_iter()? {
+        num_inputs = num_inputs.saturating_add(1);
 
-    for input in inputs {
-        let word_count = match word_count_from_input(input, settings) {
+        let input = match maybe_input {
+            Ok(input) => input,
+            Err(err) => {
+                record_error!("{err}");
+                continue;
+            }
+        };
+
+        let word_count = match word_count_from_input(&input, settings) {
             CountResult::Success(word_count) => word_count,
-            CountResult::Interrupted(word_count, error) => {
-                show!(USimpleError::new(
-                    1,
-                    format!("{}: {}", input.path_display(), error)
-                ));
+            CountResult::Interrupted(word_count, err) => {
+                record_error!("{}: {}", input.path_display(), err);
                 word_count
             }
-            CountResult::Failure(error) => {
-                show!(USimpleError::new(
-                    1,
-                    format!("{}: {}", input.path_display(), error)
-                ));
+            CountResult::Failure(err) => {
+                record_error!("{}: {}", input.path_display(), err);
                 continue;
             }
         };
@@ -598,19 +684,13 @@ fn wc(inputs: &[Input], settings: &Settings) -> UResult<()> {
         let maybe_title_str = maybe_title.as_deref();
         if let Err(err) = print_stats(settings, &word_count, maybe_title_str, number_width) {
             let title = maybe_title_str.unwrap_or("<stdin>");
-            show!(USimpleError::new(
-                1,
-                format!("failed to print result for {}: {}", title, err),
-            ));
+            record_error!("failed to print result for {title}: {err}");
         }
     }
 
     if num_inputs > 1 {
         if let Err(err) = print_stats(settings, &total_word_count, Some("total"), number_width) {
-            show!(USimpleError::new(
-                1,
-                format!("failed to print total: {err}")
-            ));
+            record_error!("failed to print total: {err}");
         }
     }
 

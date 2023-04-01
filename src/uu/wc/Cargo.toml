@@ -18,6 +18,7 @@ path = "src/wc.rs"
 clap = { workspace=true }
 uucore = { workspace=true, features=["pipes"] }
 bytecount = { workspace=true }
+thiserror = { workspace=true }
 utf-8 = { workspace=true }
 unicode-width = { workspace=true }
 
