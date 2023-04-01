@@ -20,6 +20,7 @@ use word_count::WordCount;
 
 use clap::{crate_version, Arg, ArgAction, ArgMatches, Command};
 
+use std::borrow::Cow;
 use std::cmp::max;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
@@ -41,17 +42,24 @@ struct Settings {
     show_words: bool,
     show_max_line_length: bool,
     files0_from_stdin_mode: bool,
-    title_quoting_style: QuotingStyle,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        // Defaults if none of -c, -m, -l, -w, nor -L are specified.
+        Self {
+            show_bytes: true,
+            show_chars: false,
+            show_lines: true,
+            show_words: true,
+            show_max_line_length: false,
+            files0_from_stdin_mode: false,
+        }
+    }
 }
 
 impl Settings {
     fn new(matches: &ArgMatches) -> Self {
-        let title_quoting_style = QuotingStyle::Shell {
-            escape: true,
-            always_quote: false,
-            show_control: false,
-        };
-
         let files0_from_stdin_mode = match matches.get_one::<String>(options::FILES0_FROM) {
             Some(files_0_from) => files_0_from == STDIN_REPR,
             None => false,
@@ -64,44 +72,36 @@ impl Settings {
             show_words: matches.get_flag(options::WORDS),
             show_max_line_length: matches.get_flag(options::MAX_LINE_LENGTH),
             files0_from_stdin_mode,
-            title_quoting_style,
         };
 
-        if settings.show_bytes
-            || settings.show_chars
-            || settings.show_lines
-            || settings.show_words
-            || settings.show_max_line_length
-        {
-            return settings;
-        }
-
-        Self {
-            show_bytes: true,
-            show_chars: false,
-            show_lines: true,
-            show_words: true,
-            show_max_line_length: false,
-            files0_from_stdin_mode,
-            title_quoting_style: settings.title_quoting_style,
+        if settings.number_enabled() > 0 {
+            settings
+        } else {
+            Self {
+                files0_from_stdin_mode,
+                ..Default::default()
+            }
         }
     }
 
     fn number_enabled(&self) -> u32 {
-        let mut result = 0;
-        result += self.show_bytes as u32;
-        result += self.show_chars as u32;
-        result += self.show_lines as u32;
-        result += self.show_max_line_length as u32;
-        result += self.show_words as u32;
-        result
+        [
+            self.show_bytes,
+            self.show_chars,
+            self.show_lines,
+            self.show_max_line_length,
+            self.show_words,
+        ]
+        .into_iter()
+        .map(Into::<u32>::into)
+        .sum()
     }
 }
 
 const ABOUT: &str = help_about!("wc.md");
 const USAGE: &str = help_usage!("wc.md");
 
-pub mod options {
+mod options {
     pub static BYTES: &str = "bytes";
     pub static CHAR: &str = "chars";
     pub static FILES0_FROM: &str = "files0-from";
@@ -112,6 +112,12 @@ pub mod options {
 
 static ARG_FILES: &str = "files";
 static STDIN_REPR: &str = "-";
+
+static QS_ESCAPE: &QuotingStyle = &QuotingStyle::Shell {
+    escape: true,
+    always_quote: false,
+    show_control: false,
+};
 
 enum StdinKind {
     /// Stdin specified on command-line with "-".
@@ -142,20 +148,22 @@ impl From<&OsStr> for Input {
 
 impl Input {
     /// Converts input to title that appears in stats.
-    fn to_title(&self, quoting_style: &QuotingStyle) -> Option<String> {
+    fn to_title(&self) -> Option<Cow<str>> {
         match self {
-            Self::Path(path) => Some(escape_name(&path.clone().into_os_string(), quoting_style)),
-            Self::Stdin(StdinKind::Explicit) => {
-                Some(escape_name(OsStr::new(STDIN_REPR), quoting_style))
-            }
+            Self::Path(path) => Some(match path.to_str() {
+                Some(s) if !s.contains('\n') => Cow::Borrowed(s),
+                _ => Cow::Owned(escape_name(path.as_os_str(), QS_ESCAPE)),
+            }),
+            Self::Stdin(StdinKind::Explicit) => Some(Cow::Borrowed(STDIN_REPR)),
             Self::Stdin(StdinKind::Implicit) => None,
         }
     }
 
-    fn path_display(&self, quoting_style: &QuotingStyle) -> String {
+    /// Converts input into the form that appears in errors.
+    fn path_display(&self) -> Cow<'static, str> {
         match self {
-            Self::Path(path) => escape_name(&path.clone().into_os_string(), quoting_style),
-            Self::Stdin(_) => escape_name(OsStr::new("standard input"), quoting_style),
+            Self::Path(path) => escape_name(OsStr::new(&path), QS_ESCAPE).into(),
+            Self::Stdin(_) => Cow::Borrowed("standard input"),
         }
     }
 }
@@ -573,28 +581,20 @@ fn wc(inputs: &[Input], settings: &Settings) -> UResult<()> {
             CountResult::Interrupted(word_count, error) => {
                 show!(USimpleError::new(
                     1,
-                    format!(
-                        "{}: {}",
-                        input.path_display(&settings.title_quoting_style),
-                        error
-                    )
+                    format!("{}: {}", input.path_display(), error)
                 ));
                 word_count
             }
             CountResult::Failure(error) => {
                 show!(USimpleError::new(
                     1,
-                    format!(
-                        "{}: {}",
-                        input.path_display(&settings.title_quoting_style),
-                        error
-                    )
+                    format!("{}: {}", input.path_display(), error)
                 ));
                 continue;
             }
         };
         total_word_count += word_count;
-        let maybe_title = input.to_title(&settings.title_quoting_style);
+        let maybe_title = input.to_title();
         let maybe_title_str = maybe_title.as_deref();
         if let Err(err) = print_stats(settings, &word_count, maybe_title_str, number_width) {
             let title = maybe_title_str.unwrap_or("<stdin>");
