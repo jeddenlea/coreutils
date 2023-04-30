@@ -188,9 +188,9 @@ impl<'a> Inputs<'a> {
             },
         };
 
-        // The index of each yielded item must be tracked for error reporting.
-        let mut with_idx = base.enumerate();
-        let files0_from_path = settings.files0_from.as_ref().map(|i| i.as_borrowed());
+        // The 1-based index of each yielded item must be tracked for error reporting.
+        let mut with_idx = base.enumerate().map(|(i, v)| (i + 1, v));
+        let files0_from_path = settings.files0_from.as_ref().map(|p| p.as_borrowed());
 
         let iter = iter::from_fn(move || {
             let (idx, next) = with_idx.next()?;
